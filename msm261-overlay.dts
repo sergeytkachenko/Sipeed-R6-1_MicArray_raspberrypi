@@ -1,0 +1,61 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target = <&i2s>;
+        __overlay__ {
+            status = "okay";
+        };
+    };
+
+    /*
+     * fragment@1: створюємо (або доповнюємо) вузол msm261
+     * з міткою msm261: msm261 { ... };
+     * Це дозволить надалі звертатися до нього як <&msm261>.
+     */
+    fragment@1 {
+        target-path = "/soc";
+        __overlay__ {
+            msm261: msm261 {
+                compatible = "msm,msm261s4030h0";
+                #sound-dai-cells = <0>;
+                status = "okay";
+
+                /* GPIO, поправте номери й активні стани за потреби */
+                bck-gpios  = <&gpio 18 0>;
+                ws-gpios   = <&gpio 19 0>;
+                data-gpios = <&gpio 20 0>, <&gpio 21 0>, <&gpio 22 0>, <&gpio 23 0>;
+            };
+        };
+    };
+
+    /*
+     * fragment@2: додаємо simple-audio-card,
+     * який зшиває CPU (i2s) з нашим msm261-кодеком.
+     */
+    fragment@2 {
+        target-path = "/";
+        __overlay__ {
+            sound {
+                compatible = "simple-audio-card";
+            /* змініть за потреби */
+                simple-audio-card,name = "MSM261 Microphone Array";
+                simple-audio-card,format = "i2s";
+
+                simple-audio-card,cpu {
+                    sound-dai = <&i2s>;
+                };
+
+                /* Оголошуємо sound_master (не обов’язково),
+                 * але зверніть увагу на <&msm261>
+                 */
+                sound_master: simple-audio-card,codec {
+                    sound-dai = <&msm261>;
+                };
+            };
+        };
+    };
+};
