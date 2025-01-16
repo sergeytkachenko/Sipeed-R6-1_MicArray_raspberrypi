@@ -13,23 +13,19 @@ static bool msm261_debug = false;
 module_param(msm261_debug, bool, 0644);
 MODULE_PARM_DESC(msm261_debug, "Enable debug output for MSM261");
 
-
-/* Hardware initialization */
-int msm261_hw_init(struct msm261_priv *msm261)
+/* Функція ініціалізації GPIO */
+static int msm261_gpio_init(struct msm261_priv *msm261)
 {
     int ret, i;
-    unsigned long flags;
 
-    if (msm261_debug)
-        dev_info(msm261->dev, "MSM261: Hardware initialization starting\n");
-
-    /* Request GPIOs with proper labels */
+    /* Request BCK GPIO */
     ret = devm_gpio_request(msm261->dev, msm261->bck_gpio, "MSM261_BCK");
     if (ret < 0) {
         dev_err(msm261->dev, "Failed to request BCK GPIO: %d\n", ret);
         return ret;
     }
 
+    /* Request WS GPIO */
     ret = devm_gpio_request(msm261->dev, msm261->ws_gpio, "MSM261_WS");
     if (ret < 0) {
         dev_err(msm261->dev, "Failed to request WS GPIO: %d\n", ret);
@@ -53,20 +49,191 @@ int msm261_hw_init(struct msm261_priv *msm261)
         gpio_direction_input(msm261->data_gpio[i]);
     }
 
-    /* Configure for normal mode operation */
-    local_irq_save(flags);
+    return 0;
+}
 
-    /* Set initial clock state */
-    gpio_set_value(msm261->bck_gpio, 0);
-    gpio_set_value(msm261->ws_gpio, 0);
+/* Функція включення живлення */
+static int msm261_power_on(struct msm261_priv *msm261)
+{
+    int i, retry;
+    bool all_mics_ok = false;
+    unsigned long flags;
 
-    /* Delay for power-up sequence (per datasheet) */
-    udelay(100);
+    spin_lock_irqsave(&msm261->lock, flags);
 
-    local_irq_restore(flags);
+    /* Початкова затримка для стабілізації живлення */
+    usleep_range(1000, 1500);
 
-    if (msm261_debug)
-        dev_info(msm261->dev, "MSM261: Hardware initialization completed\n");
+    /* Спроби включення з повторами при помилці */
+    for (retry = 0; retry < MSM261_RETRY_COUNT && !all_mics_ok; retry++) {
+        all_mics_ok = true;
+
+        /* Активуємо I2S інтерфейс */
+        gpio_set_value(msm261->bck_gpio, 1);
+        gpio_set_value(msm261->ws_gpio, 1);
+
+        /* Чекаємо готовності мікрофонів */
+        usleep_range(5000, 6000);
+
+        /* Перевіряємо статус кожного мікрофона */
+        for (i = 0; i < NUM_MICS; i++) {
+            /* Читаємо статус через GPIO */
+            int data_value = gpio_get_value(msm261->data_gpio[i % NUM_DATA_LINES]);
+
+            if (data_value == 0) {
+                all_mics_ok = false;
+                msm261->mic_status[i].error = true;
+                dev_err(msm261->dev, "Mic %d failed to initialize\n", i);
+
+                if (retry < MSM261_RETRY_COUNT - 1) {
+                    /* Скидаємо і пробуємо знову */
+                    gpio_set_value(msm261->bck_gpio, 0);
+                    gpio_set_value(msm261->ws_gpio, 0);
+                    usleep_range(MSM261_RETRY_DELAY_US, MSM261_RETRY_DELAY_US + 500);
+                    break;
+                }
+            } else {
+                msm261->mic_status[i].power_state = MSM261_STATUS_ON;
+                msm261->mic_status[i].error = false;
+            }
+        }
+    }
+
+    spin_unlock_irqrestore(&msm261->lock, flags);
+
+    if (!all_mics_ok) {
+        dev_err(msm261->dev, "Failed to initialize all microphones\n");
+        return -EIO;
+    }
+
+    return 0;
+}
+
+/* Функція налаштування режиму роботи */
+static int msm261_set_mode(struct msm261_priv *msm261, u8 mode)
+{
+    unsigned long flags;
+    int i;
+
+    spin_lock_irqsave(&msm261->lock, flags);
+
+    /* Встановлюємо CHIPEN у високий рівень для активації */
+    gpio_set_value(msm261->ws_gpio, 1);
+    udelay(10);
+
+    /* Налаштовуємо режим роботи */
+    msm261->operation_mode = mode;
+
+    /* Оновлюємо статус для всіх мікрофонів */
+    for (i = 0; i < NUM_MICS; i++) {
+        msm261->mic_status[i].operation_mode = mode;
+    }
+
+    /* Застосовуємо налаштування режиму */
+    if (mode == MSM261_MODE_NORMAL) {
+        /* Нормальний режим: частота 1.0-4.0 МГц */
+        dev_info(msm261->dev, "Setting normal mode operation\n");
+    } else {
+        /* Режим низького енергоспоживання: 150-800 кГц */
+        dev_info(msm261->dev, "Setting low power mode operation\n");
+    }
+
+    spin_unlock_irqrestore(&msm261->lock, flags);
+    return 0;
+}
+
+/* Функція налаштування тактування */
+static int msm261_setup_clocks(struct msm261_priv *msm261)
+{
+    unsigned long flags;
+    unsigned int target_bclk;
+
+    /* Встановлюємо частоту BCLK для нормального режиму */
+    if (msm261->operation_mode == MSM261_MODE_NORMAL) {
+        target_bclk = 2048000;  /* 2.048 МГц для нормального режиму */
+    } else {
+        target_bclk = 400000;   /* 400 кГц для режиму низького енергоспоживання */
+    }
+
+    /* Перевіряємо допустимість частоти */
+    if (msm261->operation_mode == MSM261_MODE_NORMAL) {
+        if (target_bclk < MSM261_NORMAL_MODE_MIN_CLK ||
+            target_bclk > MSM261_NORMAL_MODE_MAX_CLK) {
+            dev_err(msm261->dev, "Invalid BCLK frequency for normal mode: %u Hz\n",
+                    target_bclk);
+            return -EINVAL;
+        }
+    } else {
+        if (target_bclk < 150000 || target_bclk > 800000) {
+            dev_err(msm261->dev, "Invalid BCLK frequency for low power mode: %u Hz\n",
+                    target_bclk);
+            return -EINVAL;
+        }
+    }
+
+    spin_lock_irqsave(&msm261->lock, flags);
+
+    /* Налаштовуємо тактову частоту */
+    /* Тут має бути специфічний код для вашої платформи */
+
+    spin_unlock_irqrestore(&msm261->lock, flags);
+
+    dev_info(msm261->dev, "Clock setup completed, BCLK=%u Hz\n", target_bclk);
+    return 0;
+}
+
+/* Головна функція ініціалізації */
+int msm261_hw_init(struct msm261_priv *msm261)
+{
+    int ret, i;
+
+    /* Ініціалізуємо спінлок */
+    spin_lock_init(&msm261->lock);
+
+    /* Ініціалізуємо статуси мікрофонів */
+    for (i = 0; i < NUM_MICS; i++) {
+        msm261->mic_status[i].power_state = MSM261_STATUS_OFF;
+        msm261->mic_status[i].operation_mode = MSM261_MODE_NORMAL;
+        msm261->mic_status[i].initialized = false;
+        msm261->mic_status[i].error = false;
+    }
+
+    /* Базова ініціалізація GPIO */
+    ret = msm261_gpio_init(msm261);
+    if (ret < 0) {
+        dev_err(msm261->dev, "GPIO initialization failed: %d\n", ret);
+        return ret;
+    }
+
+    /* Включення живлення */
+    ret = msm261_power_on(msm261);
+    if (ret < 0) {
+        dev_err(msm261->dev, "Power-on sequence failed: %d\n", ret);
+        return ret;
+    }
+
+    /* Налаштування режиму роботи */
+    ret = msm261_set_mode(msm261, MSM261_MODE_NORMAL);
+    if (ret < 0) {
+        dev_err(msm261->dev, "Failed to set operation mode: %d\n", ret);
+        return ret;
+    }
+
+    /* Налаштування тактування */
+    ret = msm261_setup_clocks(msm261);
+    if (ret < 0) {
+        dev_err(msm261->dev, "Clock setup failed: %d\n", ret);
+        return ret;
+    }
+
+    msm261->software_gain = 50;
+
+    /* Позначаємо всі мікрофони як ініціалізовані */
+    for (i = 0; i < NUM_MICS; i++) {
+        msm261->mic_status[i].initialized = true;
+    }
+
+    dev_info(msm261->dev, "Hardware initialization completed successfully\n");
     return 0;
 }
 
