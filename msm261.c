@@ -1,4 +1,5 @@
 #include <linux/module.h>
+#include <linux/uio.h>
 #include <linux/init.h>
 #include <linux/platform_device.h>
 #include <sound/core.h>
@@ -226,7 +227,7 @@ int msm261_hw_init(struct msm261_priv *msm261)
         return ret;
     }
 
-    msm261->software_gain = 50;
+    msm261->software_gain = 5;
 
     /* Позначаємо всі мікрофони як ініціалізовані */
     for (i = 0; i < NUM_MICS; i++) {
@@ -446,9 +447,74 @@ static struct snd_soc_dai_driver msm261_dai = {
     .ops = &msm261_dai_ops,
 };
 
+/* Підсилення звуку */
+static int msm261_pcm_copy(struct snd_pcm_substream *substream,
+                           int channel,
+                           unsigned long pos,
+                           struct iov_iter *dst,
+                           unsigned long bytes)
+{
+    struct snd_soc_pcm_runtime *rtd = substream->private_data;
+    struct snd_soc_component *component =
+        snd_soc_rtd_to_codec(rtd, 0)->component;
+    struct msm261_priv *msm261 = snd_soc_component_get_drvdata(component);
+    struct snd_pcm_runtime *runtime = substream->runtime;
+
+    // pos тепер — зміщення в байтах від початку DMA-бфера
+    char *hwbuf = runtime->dma_area + pos;
+
+    // Виділяємо тимчасовий буфер під "bytes" байтів
+    void *tmp = kmalloc(bytes, GFP_KERNEL);
+    unsigned int sample_size, channels, frames, i;
+    size_t copied;
+
+    if (!tmp)
+        return -ENOMEM;
+
+    // Копіюємо "сирі" дані з DMA-бфера
+    memcpy(tmp, hwbuf, bytes);
+
+    // Обчислюємо розмір семпла та кількість фреймів
+    sample_size = snd_pcm_format_physical_width(runtime->format) / 8;
+    channels    = runtime->channels;
+    frames      = bytes / (channels * sample_size);
+
+    // Множимо дані на software_gain
+    if (runtime->format == SNDRV_PCM_FORMAT_S16_LE) {
+        int16_t *samples = tmp;
+        for (i = 0; i < frames * channels; i++) {
+            int32_t val = samples[i];
+            val = val * msm261->software_gain;
+            if (val > 32767)    val = 32767;
+            if (val < -32768)   val = -32768;
+            samples[i] = (int16_t)val;
+        }
+    } else if (runtime->format == SNDRV_PCM_FORMAT_S32_LE) {
+        int32_t *samples = tmp;
+        for (i = 0; i < frames * channels; i++) {
+            int64_t val = samples[i];
+            val = val * msm261->software_gain;
+            if (val > 2147483647LL)   val = 2147483647LL;
+            if (val < -2147483648LL)  val = -2147483648LL;
+            samples[i] = (int32_t)val;
+        }
+    }
+    // Якщо потрібна підтримка інших форматів - додаємо тут
+
+    // Записуємо результат у простір користувача за допомогою iov_iter
+    copied = copy_to_iter(tmp, bytes, dst);
+    kfree(tmp);
+
+    if (copied != bytes)
+        return -EFAULT;
+
+    return 0;
+}
+
 static const struct snd_pcm_ops msm261_pcm_ops = {
     .open = msm261_pcm_open,
     .close = msm261_pcm_close,
+    /* .copy = msm261_pcm_copy, */
 };
 
 static int msm261_platform_probe(struct platform_device *pdev)
